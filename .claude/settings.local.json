@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Skill(claude-api)",
+      "Skill(claude-api:*)",
+      "Bash(python3 -m py_compile main.py swarm/profiler.py swarm/orchestrator.py swarm/aggregator.py rag/retriever.py)"
+    ]
+  }
+}
