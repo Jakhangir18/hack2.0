@@ -5,9 +5,7 @@ coordinated final report — with streaming output for real-time display.
 """
 
 import json
-from typing import List
-
-import anthropic
+from typing import Any, List
 
 from .orchestrator import ExpertResult
 
@@ -55,7 +53,9 @@ async def aggregate_and_stream(
     user_request: str,
     dna: dict,
     expert_results: List[ExpertResult],
-    client: anthropic.AsyncAnthropic,
+    client: Any,
+    model: str,
+    provider: str = "openrouter",
 ) -> tuple[str, dict]:
     """
     Synthesize 4 expert plans into one final report with streaming output.
@@ -83,32 +83,73 @@ async def aggregate_and_stream(
     full_text = []
     usage_stats = {}
 
-    async with client.messages.stream(
-        model="claude-opus-4-6",
-        max_tokens=4096,
-        system=[
-            {
-                "type": "text",
-                "text": json.dumps(dna_clean, indent=2),
-                "cache_control": {"type": "ephemeral"},
-            },
-            {
-                "type": "text",
-                "text": AGGREGATOR_SYSTEM,
-            },
-        ],
-        messages=[{"role": "user", "content": user_message}],
-    ) as stream:
-        async for text_chunk in stream.text_stream:
+    if provider == "anthropic":
+        response = await client.messages.create(
+            model=model,
+            max_tokens=4096,
+            system=(
+                f"USER DNA:\n{json.dumps(dna_clean, indent=2)}\n\n{AGGREGATOR_SYSTEM}"
+            ),
+            messages=[{"role": "user", "content": user_message}],
+        )
+
+        text = "\n".join(
+            block.text for block in response.content if getattr(block, "type", "") == "text"
+        ).strip()
+        for i in range(0, len(text), 120):
+            text_chunk = text[i:i + 120]
             print(text_chunk, end="", flush=True)
             full_text.append(text_chunk)
 
-        final = await stream.get_final_message()
+        usage = getattr(response, "usage", None)
         usage_stats = {
-            "input_tokens": final.usage.input_tokens,
-            "output_tokens": final.usage.output_tokens,
-            "cache_read": final.usage.cache_read_input_tokens,
-            "cache_created": final.usage.cache_creation_input_tokens,
+            "input_tokens": usage.input_tokens if usage else "—",
+            "output_tokens": usage.output_tokens if usage else "—",
+            "cache_read": 0,
+            "cache_created": 0,
         }
+    else:
+        stream = await client.chat.completions.create(
+            model=model,
+            max_tokens=4096,
+            stream=True,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        f"USER DNA:\n{json.dumps(dna_clean, indent=2)}\n\n{AGGREGATOR_SYSTEM}"
+                    ),
+                },
+                {"role": "user", "content": user_message},
+            ],
+        )
+
+        final_usage = None
+        async for chunk in stream:
+            if chunk.usage is not None:
+                final_usage = chunk.usage
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            text_chunk = delta.content or ""
+            if text_chunk:
+                print(text_chunk, end="", flush=True)
+                full_text.append(text_chunk)
+
+        if final_usage is not None:
+            prompt_details = getattr(final_usage, "prompt_tokens_details", None)
+            usage_stats = {
+                "input_tokens": final_usage.prompt_tokens,
+                "output_tokens": final_usage.completion_tokens,
+                "cache_read": getattr(prompt_details, "cached_tokens", 0) if prompt_details else 0,
+                "cache_created": getattr(prompt_details, "cache_write_tokens", 0) if prompt_details else 0,
+            }
+        else:
+            usage_stats = {
+                "input_tokens": "—",
+                "output_tokens": "—",
+                "cache_read": "—",
+                "cache_created": "—",
+            }
 
     return "".join(full_text), usage_stats

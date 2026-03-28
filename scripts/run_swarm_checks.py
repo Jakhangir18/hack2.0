@@ -1,15 +1,10 @@
 """
-Quick checks for Mind Mirror core personalization.
+Quick checks for Mind Mirror core personalization (OpenRouter edition).
 
 What this script validates:
-1. KnowledgeBase parsing for multiple people (different notes => different context shape)
-2. Live Digital DNA extraction per sample profile (requires ANTHROPIC_API_KEY)
-3. Optional full swarm run (4 experts + aggregation) for one sample
-
-Usage:
-  /Users/jakhangirtynshimov/Desktop/hack2.0/.venv/bin/python scripts/run_swarm_checks.py
-  /Users/jakhangirtynshimov/Desktop/hack2.0/.venv/bin/python scripts/run_swarm_checks.py --full
-  /Users/jakhangirtynshimov/Desktop/hack2.0/.venv/bin/python scripts/run_swarm_checks.py --full --sample notes_fast_builder.md
+1. KnowledgeBase parsing for multiple people.
+2. Live Digital DNA extraction per sample profile (requires OPENROUTER_API_KEY).
+3. Optional full swarm run (4 experts + aggregation) for one sample.
 """
 
 from __future__ import annotations
@@ -24,7 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from dotenv import load_dotenv
-import anthropic
+from openai import AsyncOpenAI, APIStatusError, AuthenticationError
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -52,53 +47,50 @@ REQUIRED_DNA_KEYS = {
 
 
 class _MockUsage:
-    def __init__(self, input_tokens: int = 150, output_tokens: int = 250):
-        self.input_tokens = input_tokens
-        self.output_tokens = output_tokens
-        self.cache_read_input_tokens = max(0, input_tokens // 3)
-        self.cache_creation_input_tokens = max(0, input_tokens // 2)
-
-
-class _MockResponse:
-    def __init__(self, stop_reason: str, content: list, input_tokens: int = 150, output_tokens: int = 250):
-        self.stop_reason = stop_reason
-        self.content = content
-        self.usage = _MockUsage(input_tokens=input_tokens, output_tokens=output_tokens)
+    def __init__(self, prompt_tokens: int = 150, completion_tokens: int = 250):
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+        self.total_tokens = prompt_tokens + completion_tokens
+        self.prompt_tokens_details = SimpleNamespace(
+            cached_tokens=max(0, prompt_tokens // 3),
+            cache_write_tokens=max(0, prompt_tokens // 2),
+        )
 
 
 class _MockStream:
     def __init__(self, text: str):
         self._chunks = [text[i:i + 80] for i in range(0, len(text), 80)]
 
-    async def __aenter__(self):
+    def __aiter__(self):
+        self._index = 0
         return self
 
-    async def __aexit__(self, exc_type, exc, tb):
-        return False
-
-    @property
-    def text_stream(self):
-        async def _gen():
-            for chunk in self._chunks:
-                yield chunk
-        return _gen()
-
-    async def get_final_message(self):
-        return SimpleNamespace(usage=_MockUsage(input_tokens=220, output_tokens=420))
+    async def __anext__(self):
+        if self._index < len(self._chunks):
+            chunk_text = self._chunks[self._index]
+            self._index += 1
+            return SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(content=chunk_text))],
+                usage=None,
+            )
+        if self._index == len(self._chunks):
+            self._index += 1
+            return SimpleNamespace(choices=[], usage=_MockUsage(prompt_tokens=220, completion_tokens=420))
+        raise StopAsyncIteration
 
 
 def _extract_name(notes: str) -> str:
-    m = re.search(r"I am\s+([A-Za-z]+)", notes)
-    return m.group(1) if m else "User"
+    match = re.search(r"I am\s+([A-Za-z]+)", notes)
+    return match.group(1) if match else "User"
 
 
 def _extract_bullet_values(notes: str, heading: str, max_items: int = 3) -> list[str]:
-    m = re.search(rf"##\s+{re.escape(heading)}\n([\s\S]*?)(\n##\s+|$)", notes)
-    if not m:
+    match = re.search(rf"##\s+{re.escape(heading)}\n([\s\S]*?)(\n##\s+|$)", notes)
+    if not match:
         return []
-    block = m.group(1)
+
     values = []
-    for line in block.splitlines():
+    for line in match.group(1).splitlines():
         line = line.strip()
         if line.startswith("- "):
             values.append(line[2:].strip())
@@ -106,120 +98,112 @@ def _extract_bullet_values(notes: str, heading: str, max_items: int = 3) -> list
 
 
 def _extract_first_line(notes: str, heading: str, fallback: str) -> str:
-    m = re.search(rf"##\s+{re.escape(heading)}\n([\s\S]*?)(\n##\s+|$)", notes)
-    if not m:
+    match = re.search(rf"##\s+{re.escape(heading)}\n([\s\S]*?)(\n##\s+|$)", notes)
+    if not match:
         return fallback
-    block = m.group(1).strip()
-    for line in block.splitlines():
-        s = line.strip()
-        if s and not s.startswith("- "):
-            return s
+
+    for line in match.group(1).splitlines():
+        stripped = line.strip()
+        if stripped and not stripped.startswith("- "):
+            return stripped
     return fallback
 
 
 def _mock_dna_from_notes(notes: str) -> dict:
     name = _extract_name(notes)
-    tech = _extract_bullet_values(notes, "Tech Stack & Preferences", 4)
-    values = _extract_bullet_values(notes, "Core Values", 4)
-    goals = _extract_bullet_values(notes, "Current Projects & Goals", 3)
-    models = _extract_bullet_values(notes, "Mental Models I Use", 3)
-    red_flags = _extract_bullet_values(notes, "Red Flags I Watch For", 3)
-    comm = _extract_first_line(notes, "Communication Style", "Direct and concise")
-    biz = _extract_first_line(notes, "Business Philosophy", "Ship and learn quickly")
-    risk = _extract_first_line(notes, "Risk Appetite", "Medium")
-
     return {
         "name": name,
-        "communication_style": comm,
-        "tech_stack": tech or ["Python", "TypeScript"],
-        "core_values": values or ["Speed", "Ownership"],
-        "business_philosophy": biz,
+        "communication_style": _extract_first_line(notes, "Communication Style", "Direct and concise"),
+        "tech_stack": _extract_bullet_values(notes, "Tech Stack & Preferences", 4) or ["Python", "TypeScript"],
+        "core_values": _extract_bullet_values(notes, "Core Values", 4) or ["Speed", "Ownership"],
+        "business_philosophy": _extract_first_line(notes, "Business Philosophy", "Ship and learn quickly"),
         "decision_style": "Evidence-driven with fast iteration",
-        "risk_appetite": risk,
+        "risk_appetite": _extract_first_line(notes, "Risk Appetite", "Medium"),
         "expertise_areas": ["Product", "Execution", "AI workflows"],
-        "mental_models": models or ["First principles", "Pareto"],
-        "red_flags": red_flags or ["Scope creep"],
-        "goals": goals or ["Launch and validate quickly"],
+        "mental_models": _extract_bullet_values(notes, "Mental Models I Use", 3) or ["First principles", "Pareto"],
+        "red_flags": _extract_bullet_values(notes, "Red Flags I Watch For", 3) or ["Scope creep"],
+        "goals": _extract_bullet_values(notes, "Current Projects & Goals", 3) or ["Launch and validate quickly"],
         "personality_summary": f"{name} is pragmatic, goal-oriented, and favors actionable plans.",
     }
 
 
-class _MockMessages:
+class _MockCompletions:
     def __init__(self):
         self._tool_counter = 0
 
     async def create(self, **kwargs):
-        system = kwargs.get("system")
-        messages = kwargs.get("messages", [])
-
-        # Profiler call uses system string.
-        if isinstance(system, str):
-            user_content = messages[0]["content"][0]["text"]
-            dna = _mock_dna_from_notes(user_content)
-            text_block = SimpleNamespace(type="text", text=json.dumps(dna, ensure_ascii=True))
-            return _MockResponse("end_turn", [text_block], input_tokens=180, output_tokens=260)
-
-        # Orchestrator calls use system blocks and tools.
-        role_prompt = system[1]["text"] if system and len(system) > 1 else ""
-        if "Lead Developer" in role_prompt:
-            section = "Tech Stack & Preferences"
-        elif "Growth Marketer" in role_prompt:
-            section = "What I Look For in Products"
-        elif "Security & Risk Analyst" in role_prompt:
-            section = "Red Flags I Watch For"
-        else:
-            section = "Business Philosophy"
-
-        last_content = messages[-1]["content"] if messages else ""
-        if isinstance(last_content, list):
-            # Final answer after tool result.
-            plan = (
-                "## Mock Action Plan\n"
-                "1. Define scope and target user.\n"
-                "2. Build a tiny MVP with measurable success metrics.\n"
-                "3. Validate with 5 real users this week."
+        if kwargs.get("stream"):
+            text = (
+                "# Mock Final Plan\n\n"
+                "## Executive Summary\n"
+                "This is a synthesized plan from PM, Dev, Marketing, and Security viewpoints.\n\n"
+                "## This Week\n"
+                "1. Validate problem with users\n"
+                "2. Build MVP scope\n"
+                "3. Launch and measure\n"
             )
-            text_block = SimpleNamespace(type="text", text=plan)
-            return _MockResponse("end_turn", [text_block], input_tokens=140, output_tokens=220)
+            return _MockStream(text)
 
-        # First turn asks for one relevant section.
-        self._tool_counter += 1
-        tool_block = SimpleNamespace(
-            type="tool_use",
-            name="read_section",
-            input={"section_name": section},
-            id=f"mock-tool-{self._tool_counter}",
-        )
-        return _MockResponse("tool_use", [tool_block], input_tokens=120, output_tokens=80)
+        messages = kwargs.get("messages", [])
+        tools = kwargs.get("tools")
+        system_text = "\n".join(m.get("content", "") for m in messages if m.get("role") == "system")
 
-    def stream(self, **kwargs):
-        text = (
-            "# Mock Final Plan\n\n"
-            "## Executive Summary\n"
-            "This is a synthesized plan from PM, Dev, Marketing, and Security viewpoints.\n\n"
-            "## This Week\n"
-            "1. Validate problem with users\n"
-            "2. Build MVP scope\n"
-            "3. Launch and measure\n"
-        )
-        return _MockStream(text)
+        if "The Profiler" in system_text:
+            user_text = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
+            dna = _mock_dna_from_notes(user_text)
+            message = SimpleNamespace(content=json.dumps(dna, ensure_ascii=True), tool_calls=[])
+            return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=_MockUsage(180, 260))
+
+        if tools:
+            has_tool_result = any(m.get("role") == "tool" for m in messages if isinstance(m, dict))
+            if has_tool_result:
+                plan = (
+                    "## Mock Action Plan\n"
+                    "1. Define scope and target user.\n"
+                    "2. Build a tiny MVP with measurable success metrics.\n"
+                    "3. Validate with 5 real users this week."
+                )
+                message = SimpleNamespace(content=plan, tool_calls=[])
+                return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=_MockUsage(140, 220))
+
+            if "Lead Developer" in system_text:
+                section = "Tech Stack & Preferences"
+            elif "Growth Marketer" in system_text:
+                section = "What I Look For in Products"
+            elif "Security & Risk Analyst" in system_text:
+                section = "Red Flags I Watch For"
+            else:
+                section = "Business Philosophy"
+
+            self._tool_counter += 1
+            tool_call = SimpleNamespace(
+                id=f"mock-tool-{self._tool_counter}",
+                type="function",
+                function=SimpleNamespace(name="read_section", arguments=json.dumps({"section_name": section})),
+            )
+            message = SimpleNamespace(content="", tool_calls=[tool_call])
+            return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=_MockUsage(120, 80))
+
+        message = SimpleNamespace(content="Mock response", tool_calls=[])
+        return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=_MockUsage(100, 80))
 
 
-class _MockAnthropicClient:
+class _MockChat:
     def __init__(self):
-        self.messages = _MockMessages()
+        self.completions = _MockCompletions()
 
 
-def build_mock_client() -> _MockAnthropicClient:
-    return _MockAnthropicClient()
+class _MockOpenAIClient:
+    def __init__(self):
+        self.chat = _MockChat()
+
+
+def build_mock_client() -> _MockOpenAIClient:
+    return _MockOpenAIClient()
 
 
 def _samples_dir() -> Path:
-    return Path(__file__).resolve().parents[1] / "samples"
-
-
-def _project_root() -> Path:
-    return PROJECT_ROOT
+    return PROJECT_ROOT / "samples"
 
 
 def load_sample_notes() -> dict[str, str]:
@@ -242,13 +226,13 @@ def check_knowledge_base(notes_by_file: dict[str, str]) -> None:
             raise AssertionError(f"Too few sections parsed for {filename}")
 
 
-async def check_profiler(notes_by_file: dict[str, str], client: anthropic.AsyncAnthropic) -> dict[str, dict]:
+async def check_profiler(notes_by_file: dict[str, str], client, model: str) -> dict[str, dict]:
     print("\n=== CHECK 2: Profiler personalization (live API) ===")
     dna_by_file: dict[str, dict] = {}
 
     for filename, notes in notes_by_file.items():
         print(f"- Profiling {filename} ...", end=" ", flush=True)
-        dna = await create_digital_dna(notes, client)
+        dna = await create_digital_dna(notes, client, model)
         cache_stats = dna.get("_cache_stats", {})
 
         missing = REQUIRED_DNA_KEYS - set(dna.keys())
@@ -262,27 +246,20 @@ async def check_profiler(notes_by_file: dict[str, str], client: anthropic.AsyncA
             f"cache_read={cache_stats.get('cache_read', 'n/a')})"
         )
 
-    # Basic differentiation sanity check: personality summary should differ
     summaries = {k: v.get("personality_summary", "") for k, v in dna_by_file.items()}
-    unique_summaries = len(set(summaries.values()))
-    if unique_summaries < max(2, len(summaries) - 1):
+    if len(set(summaries.values())) < max(2, len(summaries) - 1):
         raise AssertionError("Profiler outputs are too similar across distinct personalities")
 
     print("- Personalization sanity check: PASS (summaries are differentiated)")
     return dna_by_file
 
 
-async def check_full_swarm(
-    filename: str,
-    notes: str,
-    dna: dict,
-    client: anthropic.AsyncAnthropic,
-) -> None:
+async def check_full_swarm(filename: str, notes: str, dna: dict, client, model: str) -> None:
     print("\n=== CHECK 3: Full swarm + aggregation (live API) ===")
     print(f"- Running full pipeline for {filename}")
 
     kb = KnowledgeBase(notes)
-    orchestrator = SwarmOrchestrator(client)
+    orchestrator = SwarmOrchestrator(client, model)
     user_request = "I want to launch a personalized AI planner product in 30 days"
 
     expert_results = await orchestrator.run(user_request=user_request, dna=dna, kb=kb)
@@ -290,10 +267,10 @@ async def check_full_swarm(
         raise AssertionError(f"Expected 4 expert results, got {len(expert_results)}")
 
     print("- Experts completed:")
-    for r in expert_results:
+    for result in expert_results:
         print(
-            f"  {r.emoji} {r.title}: calls={r.total_api_calls}, "
-            f"sections_read={len(r.tool_calls)}, input_tokens={r.input_tokens}"
+            f"  {result.emoji} {result.title}: calls={result.total_api_calls}, "
+            f"sections_read={len(result.tool_calls)}, input_tokens={result.input_tokens}"
         )
 
     _, agg_stats = await aggregate_and_stream(
@@ -301,6 +278,7 @@ async def check_full_swarm(
         dna=dna,
         expert_results=expert_results,
         client=client,
+        model=model,
     )
     print("\n- Aggregator stats:")
     print(
@@ -317,31 +295,36 @@ async def async_main(run_full: bool, full_sample: str | None) -> None:
 
     check_knowledge_base(notes_by_file)
 
-    load_dotenv(_project_root() / ".env")
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    use_mock = False
-    if not api_key:
-        use_mock = True
-        print("\nNo ANTHROPIC_API_KEY found in .env. Switching to MOCK mode.")
+    load_dotenv(PROJECT_ROOT / ".env")
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    model = os.getenv("OPENROUTER_MODEL", "openrouter/free")
 
-    if use_mock:
+    if not api_key:
+        print("\nNo OPENROUTER_API_KEY found in .env. Switching to MOCK mode.")
         client = build_mock_client()
-        dna_by_file = await check_profiler(notes_by_file, client)
+        dna_by_file = await check_profiler(notes_by_file, client, model)
     else:
-        client = anthropic.AsyncAnthropic(api_key=api_key)
+        client = AsyncOpenAI(
+            api_key=api_key,
+            base_url="https://openrouter.ai/api/v1",
+            default_headers={
+                "HTTP-Referer": os.getenv("OPENROUTER_REFERER", "http://localhost"),
+                "X-OpenRouter-Title": os.getenv("OPENROUTER_APP_NAME", "Mind Mirror"),
+            },
+        )
         try:
-            dna_by_file = await check_profiler(notes_by_file, client)
-        except anthropic.BadRequestError as e:
-            print(f"\nLive API unavailable ({e.__class__.__name__}). Switching to MOCK mode.")
+            dna_by_file = await check_profiler(notes_by_file, client, model)
+        except (APIStatusError, AuthenticationError, AssertionError) as err:
+            print(f"\nLive API unavailable ({err.__class__.__name__}). Switching to MOCK mode.")
             client = build_mock_client()
-            dna_by_file = await check_profiler(notes_by_file, client)
+            dna_by_file = await check_profiler(notes_by_file, client, model)
 
     if run_full:
         target = full_sample or next(iter(notes_by_file.keys()))
         if target not in notes_by_file:
             available = ", ".join(notes_by_file.keys())
             raise ValueError(f"Sample '{target}' not found. Available: {available}")
-        await check_full_swarm(target, notes_by_file[target], dna_by_file[target], client)
+        await check_full_swarm(target, notes_by_file[target], dna_by_file[target], client, model)
 
     print("\nAll requested checks completed successfully.")
 

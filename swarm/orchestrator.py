@@ -20,10 +20,8 @@ All 4 agents still run in PARALLEL via asyncio.gather.
 import asyncio
 import json
 import time
-from dataclasses import dataclass, field
-from typing import List
-
-import anthropic
+from dataclasses import dataclass
+from typing import Any, List
 
 from rag.knowledge_base import KnowledgeBase, TOOL_READ_SECTION
 
@@ -139,7 +137,9 @@ async def _run_expert_jit(
     user_request: str,
     dna: dict,
     kb: KnowledgeBase,
-    client: anthropic.AsyncAnthropic,
+    client: Any,
+    model: str,
+    provider: str,
 ) -> ExpertResult:
     """
     Run one expert agent with JIT context loading.
@@ -160,19 +160,10 @@ async def _run_expert_jit(
         f"{kb.get_index()}"
     )
 
-    system_blocks = [
-        # Block 1: Shared stable content — CACHED, read from cache on agents 2-4
-        {
-            "type": "text",
-            "text": shared_context,
-            "cache_control": {"type": "ephemeral"},
-        },
-        # Block 2: Role-specific — NOT cached (different per agent, short)
-        {
-            "type": "text",
-            "text": _build_role_system_prompt(role, dna),
-        },
-    ]
+    system_prompt = (
+        f"{shared_context}\n\n"
+        f"{_build_role_system_prompt(role, dna)}"
+    )
 
     messages = [
         {
@@ -194,48 +185,155 @@ async def _run_expert_jit(
     # ── JIT tool-use loop ─────────────────────────────────────────────────────
     for _ in range(MAX_TOOL_CALLS + 1):  # +1 for final plan call
         api_call_count += 1
-        response = await client.messages.create(
-            model="claude-opus-4-6",
-            max_tokens=2048,
-            system=system_blocks,
-            tools=[TOOL_READ_SECTION],
-            tool_choice={"type": "auto"},
-            messages=messages,
-        )
+        if provider == "anthropic":
+            response = await client.messages.create(
+                model=model,
+                max_tokens=2048,
+                system=system_prompt,
+                tools=[TOOL_READ_SECTION],
+                messages=messages,
+            )
 
-        total_input_tokens += response.usage.input_tokens
-        total_cache_read += response.usage.cache_read_input_tokens
-        total_cache_created += response.usage.cache_creation_input_tokens
+            usage = getattr(response, "usage", None)
+            total_input_tokens += usage.input_tokens if usage else 0
 
-        # Done — no more tool calls
-        if response.stop_reason == "end_turn":
-            text = next((b.text for b in response.content if b.type == "text"), "")
-            break
+            blocks = getattr(response, "content", None) or []
+            assistant_blocks = []
+            text_parts = []
+            tool_uses = []
 
-        # Handle tool calls
-        if response.stop_reason == "tool_use":
-            tool_results = []
-            for block in response.content:
-                if block.type == "tool_use" and block.name == "read_section":
-                    section_name = block.input.get("section_name", "")
-                    result = kb.read_section(section_name)
-                    tool_calls_made.append(ToolCall(section_name=section_name, result=result))
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result,
-                    })
+            for block in blocks:
+                block_type = getattr(block, "type", "")
+                if block_type == "text":
+                    text_value = getattr(block, "text", "") or ""
+                    if text_value:
+                        text_parts.append(text_value)
+                    assistant_blocks.append({"type": "text", "text": text_value})
+                elif block_type == "tool_use":
+                    tool_uses.append(block)
+                    assistant_blocks.append(
+                        {
+                            "type": "tool_use",
+                            "id": block.id,
+                            "name": block.name,
+                            "input": block.input,
+                        }
+                    )
 
-            # Append assistant response + tool results to conversation
-            messages.append({"role": "assistant", "content": response.content})
-            messages.append({"role": "user", "content": tool_results})
+            if not tool_uses:
+                text = "\n".join(part for part in text_parts if part).strip()
+                break
+
+            messages.append({"role": "assistant", "content": assistant_blocks})
+
+            for tc in tool_uses:
+                if tc.name != "read_section":
+                    continue
+                args = tc.input or {}
+                section_name = (args.get("section_name", "") or "").strip()
+                if not section_name:
+                    used_sections = [t.section_name for t in tool_calls_made if t.section_name]
+                    suggested_sections = role.get("suggested_sections", [])
+                    section_name = next((s for s in suggested_sections if s not in used_sections), "")
+                if not section_name:
+                    section_name = "About Me"
+
+                result = kb.read_section(section_name)
+                tool_calls_made.append(ToolCall(section_name=section_name, result=result))
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tc.id,
+                                "content": result,
+                            }
+                        ],
+                    }
+                )
         else:
-            # Unexpected stop reason — take whatever text is there
-            text = next((b.text for b in response.content if b.type == "text"), "")
-            break
+            tool_schema = {
+                "type": "function",
+                "function": {
+                    "name": TOOL_READ_SECTION["name"],
+                    "description": TOOL_READ_SECTION["description"],
+                    "parameters": TOOL_READ_SECTION["input_schema"],
+                },
+            }
+            openai_messages = [{"role": "system", "content": system_prompt}] + messages
+            response = await client.chat.completions.create(
+                model=model,
+                max_tokens=2048,
+                tools=[tool_schema],
+                tool_choice="auto",
+                messages=openai_messages,
+            )
+
+            usage = getattr(response, "usage", None)
+            total_input_tokens += usage.prompt_tokens if usage else 0
+            prompt_details = getattr(usage, "prompt_tokens_details", None)
+            if prompt_details:
+                total_cache_read += getattr(prompt_details, "cached_tokens", 0) or 0
+                total_cache_created += getattr(prompt_details, "cache_write_tokens", 0) or 0
+
+            choices = getattr(response, "choices", None) or []
+            if not choices or getattr(choices[0], "message", None) is None:
+                text = ""
+                break
+            assistant_msg = choices[0].message
+            tool_calls = assistant_msg.tool_calls or []
+
+            # Done — no more tool calls
+            if not tool_calls:
+                text = assistant_msg.content or ""
+                break
+
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": assistant_msg.content or "",
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": tc.type,
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        }
+                        for tc in tool_calls
+                    ],
+                }
+            )
+
+            for tc in tool_calls:
+                if tc.type != "function" or tc.function.name != "read_section":
+                    continue
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                section_name = (args.get("section_name", "") or "").strip()
+                if not section_name:
+                    used_sections = [t.section_name for t in tool_calls_made if t.section_name]
+                    suggested_sections = role.get("suggested_sections", [])
+                    section_name = next((s for s in suggested_sections if s not in used_sections), "")
+                if not section_name:
+                    section_name = "About Me"
+                result = kb.read_section(section_name)
+                tool_calls_made.append(ToolCall(section_name=section_name, result=result))
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "name": "read_section",
+                        "content": result,
+                    }
+                )
     else:
-        # Hit loop limit — extract whatever text is present
-        text = next((b.text for b in response.content if b.type == "text"), "")
+        # Hit loop limit without final assistant content.
+        text = ""
 
     duration_ms = (time.monotonic() - start) * 1000
 
@@ -259,8 +357,10 @@ class SwarmOrchestrator:
     Each agent fetches only the knowledge sections it needs.
     """
 
-    def __init__(self, client: anthropic.AsyncAnthropic):
+    def __init__(self, client: Any, model: str, provider: str = "openrouter"):
         self.client = client
+        self.model = model
+        self.provider = provider
 
     async def run(
         self,
@@ -270,7 +370,7 @@ class SwarmOrchestrator:
     ) -> List[ExpertResult]:
         """Launch all 4 experts simultaneously and collect results."""
         tasks = [
-            _run_expert_jit(role, user_request, dna, kb, self.client)
+            _run_expert_jit(role, user_request, dna, kb, self.client, self.model, self.provider)
             for role in EXPERT_ROLES
         ]
         results = await asyncio.gather(*tasks)

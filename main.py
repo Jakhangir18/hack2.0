@@ -24,7 +24,14 @@ import argparse
 from pathlib import Path
 
 from dotenv import load_dotenv
-import anthropic
+from anthropic import AsyncAnthropic
+from anthropic import APIConnectionError as AnthropicAPIConnectionError
+from anthropic import APIStatusError as AnthropicAPIStatusError
+from anthropic import AuthenticationError as AnthropicAuthenticationError
+from openai import AsyncOpenAI
+from openai import APIConnectionError as OpenAIAPIConnectionError
+from openai import APIStatusError as OpenAIAPIStatusError
+from openai import AuthenticationError as OpenAIAuthenticationError
 
 from swarm.profiler import create_digital_dna
 from swarm.orchestrator import SwarmOrchestrator
@@ -55,7 +62,7 @@ def banner():
 ║   🧠  M I N D   M I R R O R  :  A C T I V E   S W A R M    ║
 ║                                                              ║
 ║   Profiler → JIT Swarm Orchestrator → Aggregator             ║
-║   Powered by Claude Opus 4.6 + Prompt Caching + JIT RAG      ║
+║   Powered by OpenRouter + JIT RAG                             ║
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
 """))
@@ -78,12 +85,34 @@ def separator():
 # ── Main pipeline ──────────────────────────────────────────────────────────────
 
 async def run_pipeline(notes_path: str, user_request: str | None):
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        print(c(RED, "✗ ANTHROPIC_API_KEY not set. Copy .env.example → .env and add your key."))
+    provider = os.getenv("LLM_PROVIDER", "openrouter").strip().lower()
+    if provider not in {"openrouter", "anthropic"}:
+        print(c(RED, f"✗ Unsupported LLM_PROVIDER: {provider}"))
+        print(c(YELLOW, "  Use LLM_PROVIDER=openrouter or LLM_PROVIDER=anthropic."))
         sys.exit(1)
 
-    client = anthropic.AsyncAnthropic(api_key=api_key)
+    if provider == "anthropic":
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        model = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-6")
+        if not api_key:
+            print(c(RED, "✗ ANTHROPIC_API_KEY not set. Update .env and try again."))
+            sys.exit(1)
+        client = AsyncAnthropic(api_key=api_key)
+    else:
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        model = os.getenv("OPENROUTER_MODEL", "openrouter/free")
+        if not api_key:
+            print(c(RED, "✗ OPENROUTER_API_KEY not set. Update .env and try again."))
+            sys.exit(1)
+
+        client = AsyncOpenAI(
+            api_key=api_key,
+            base_url="https://openrouter.ai/api/v1",
+            default_headers={
+                "HTTP-Referer": os.getenv("OPENROUTER_REFERER", "http://localhost"),
+                "X-OpenRouter-Title": os.getenv("OPENROUTER_APP_NAME", "Mind Mirror"),
+            },
+        )
 
     # ── Load notes + build knowledge base ─────────────────────────────────────
     notes_file = Path(notes_path)
@@ -108,7 +137,7 @@ async def run_pipeline(notes_path: str, user_request: str | None):
     phase_header(1, "The Profiler", "Analyzing your notes → building Digital DNA...")
 
     t0 = time.monotonic()
-    dna = await create_digital_dna(user_notes, client)
+    dna = await create_digital_dna(user_notes, client, model, provider=provider)
     t1 = time.monotonic()
 
     cache_stats = dna.pop("_cache_stats", {})
@@ -151,7 +180,7 @@ async def run_pipeline(notes_path: str, user_request: str | None):
     print()
 
     t2 = time.monotonic()
-    orchestrator = SwarmOrchestrator(client)
+    orchestrator = SwarmOrchestrator(client, model, provider=provider)
     expert_results = await orchestrator.run(user_request, dna, kb)
     t3 = time.monotonic()
 
@@ -214,7 +243,7 @@ async def run_pipeline(notes_path: str, user_request: str | None):
 
     t4 = time.monotonic()
     final_report, agg_stats = await aggregate_and_stream(
-        user_request, dna, expert_results, client
+        user_request, dna, expert_results, client, model, provider=provider
     )
     t5 = time.monotonic()
 
@@ -255,7 +284,34 @@ def main():
     args = parser.parse_args()
 
     banner()
-    asyncio.run(run_pipeline(args.notes, args.request))
+    try:
+        asyncio.run(run_pipeline(args.notes, args.request))
+    except (OpenAIAuthenticationError, AnthropicAuthenticationError):
+        provider = os.getenv("LLM_PROVIDER", "openrouter").strip().lower()
+        if provider == "anthropic":
+            print(c(RED, "\n✗ Anthropic authentication failed."))
+            print(c(YELLOW, "  Check ANTHROPIC_API_KEY in .env and try again."))
+        else:
+            print(c(RED, "\n✗ OpenRouter authentication failed."))
+            print(c(YELLOW, "  Check OPENROUTER_API_KEY in .env and try again."))
+        sys.exit(1)
+    except (OpenAIAPIStatusError, AnthropicAPIStatusError) as exc:
+        provider = os.getenv("LLM_PROVIDER", "openrouter").strip().lower()
+        provider_label = "Anthropic" if provider == "anthropic" else "OpenRouter"
+        print(c(RED, f"\n✗ {provider_label} rejected the request."))
+        print(c(YELLOW, f"  Status: {exc.status_code}"))
+        print(c(YELLOW, f"  Details: {exc}"))
+        sys.exit(1)
+    except (OpenAIAPIConnectionError, AnthropicAPIConnectionError) as exc:
+        provider = os.getenv("LLM_PROVIDER", "openrouter").strip().lower()
+        provider_label = "Anthropic" if provider == "anthropic" else "OpenRouter"
+        print(c(RED, f"\n✗ Could not reach {provider_label} API."))
+        print(c(YELLOW, f"  Details: {exc}"))
+        sys.exit(1)
+    except Exception as exc:
+        print(c(RED, "\n✗ Unexpected runtime error."))
+        print(c(YELLOW, f"  Details: {exc}"))
+        sys.exit(1)
 
 
 if __name__ == "__main__":
