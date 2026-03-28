@@ -1,13 +1,18 @@
 """
 Mind Mirror: Active Swarm Core
 ================================
-A personalized AI brainstorming system that combines:
-  - Digital DNA profiling (The Profiler)
-  - Parallel expert swarm (The Orchestrator)
-  - Unified synthesis with streaming (The Aggregator)
+A personalized AI brainstorming system combining:
+  Phase A — The Profiler:     user notes → Digital DNA
+  Phase B — The Swarm:        4 parallel experts with JIT context loading
+  Phase C — The Aggregator:   unified streaming report
+
+JIT Context Strategy:
+  Agents receive a ~300-token INDEX instead of full notes.
+  They call `read_section` to fetch only what they need.
+  Result: ~75% fewer tokens vs full context injection.
 
 Usage:
-  python main.py [--notes path/to/notes.md] [--request "your idea here"]
+  python main.py [--notes path/to/notes.md] [--request "your idea"]
 """
 
 import asyncio
@@ -24,21 +29,21 @@ import anthropic
 from swarm.profiler import create_digital_dna
 from swarm.orchestrator import SwarmOrchestrator
 from swarm.aggregator import aggregate_and_stream
-from rag.retriever import NoteRetriever
+from rag.knowledge_base import KnowledgeBase
 
 load_dotenv()
 
-# ── Terminal colors (no external deps) ────────────────────────────────────────
-RESET  = "\033[0m"
-BOLD   = "\033[1m"
-DIM    = "\033[2m"
-CYAN   = "\033[96m"
-GREEN  = "\033[92m"
-YELLOW = "\033[93m"
-MAGENTA= "\033[95m"
-RED    = "\033[91m"
-BLUE   = "\033[94m"
-WHITE  = "\033[97m"
+# ── Terminal colors ────────────────────────────────────────────────────────────
+RESET   = "\033[0m"
+BOLD    = "\033[1m"
+DIM     = "\033[2m"
+CYAN    = "\033[96m"
+GREEN   = "\033[92m"
+YELLOW  = "\033[93m"
+MAGENTA = "\033[95m"
+RED     = "\033[91m"
+BLUE    = "\033[94m"
+WHITE   = "\033[97m"
 
 def c(color: str, text: str) -> str:
     return f"{color}{text}{RESET}"
@@ -49,8 +54,8 @@ def banner():
 ║                                                              ║
 ║   🧠  M I N D   M I R R O R  :  A C T I V E   S W A R M    ║
 ║                                                              ║
-║   Profiler → Swarm Orchestrator → Aggregator                 ║
-║   Powered by Claude Opus 4.6 + Prompt Caching                ║
+║   Profiler → JIT Swarm Orchestrator → Aggregator             ║
+║   Powered by Claude Opus 4.6 + Prompt Caching + JIT RAG      ║
 ║                                                              ║
 ╚══════════════════════════════════════════════════════════════╝
 """))
@@ -64,10 +69,11 @@ def phase_header(num: int, title: str, subtitle: str = ""):
     print()
 
 def stat_line(label: str, value: str, color: str = WHITE):
-    print(f"  {c(DIM, label):30s} {c(color, value)}")
+    print(f"  {c(DIM, label):38s} {c(color, value)}")
 
 def separator():
     print(c(DIM, "─" * 66))
+
 
 # ── Main pipeline ──────────────────────────────────────────────────────────────
 
@@ -79,14 +85,22 @@ async def run_pipeline(notes_path: str, user_request: str | None):
 
     client = anthropic.AsyncAnthropic(api_key=api_key)
 
-    # ── Load notes ────────────────────────────────────────────────────────────
+    # ── Load notes + build knowledge base ─────────────────────────────────────
     notes_file = Path(notes_path)
     if not notes_file.exists():
         print(c(RED, f"✗ Notes file not found: {notes_path}"))
         sys.exit(1)
 
     user_notes = notes_file.read_text(encoding="utf-8")
-    print(c(DIM, f"  Loaded notes: {len(user_notes):,} chars from {notes_file.name}"))
+    kb = KnowledgeBase(user_notes)
+    stats = kb.token_estimate()
+
+    print(c(DIM, f"  Loaded: {notes_file.name}  |  "
+                 f"{stats['sections_count']} sections  |  "
+                 f"~{stats['full_notes_tokens']:,} tokens full  →  "
+                 f"~{stats['index_tokens']:,} tokens index"))
+    print(c(GREEN, f"  JIT index saves ~{stats['full_notes_tokens'] - stats['index_tokens']:,} "
+                   f"tokens per agent vs full injection"))
 
     # ══════════════════════════════════════════════════════════════════════════
     # PHASE A: The Profiler → Digital DNA
@@ -100,14 +114,14 @@ async def run_pipeline(notes_path: str, user_request: str | None):
     cache_stats = dna.pop("_cache_stats", {})
     print(c(GREEN, f"  ✓ Digital DNA extracted in {(t1-t0):.1f}s"))
     print()
-    print(c(BOLD, "  Digital DNA Profile:"))
+    print(c(BOLD, "  Your Digital DNA:"))
     for key, val in dna.items():
         if key == "personality_summary":
             print(f"    {c(CYAN, key)}: {c(DIM, str(val)[:120])}")
         elif isinstance(val, list):
-            print(f"    {c(CYAN, key)}: {c(WHITE, ', '.join(str(v) for v in val[:4]))}")
+            print(f"    {c(CYAN, key)}: {c(WHITE, ', '.join(str(v) for v in val[:5]))}")
         else:
-            print(f"    {c(CYAN, key)}: {c(WHITE, str(val)[:80])}")
+            print(f"    {c(CYAN, key)}: {c(WHITE, str(val)[:90])}")
 
     print()
     separator()
@@ -115,78 +129,86 @@ async def run_pipeline(notes_path: str, user_request: str | None):
     stat_line("Cache created:", str(cache_stats.get("cache_created", "—")), BLUE)
     separator()
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # RAG: Retrieve relevant notes
-    # ══════════════════════════════════════════════════════════════════════════
+    # ── Get user request ──────────────────────────────────────────────────────
     if not user_request:
         print()
-        print(c(BOLD + WHITE, "  💭  What idea do you want to explore? "))
+        print(c(BOLD + WHITE, "  💭  What idea do you want to explore?"))
         user_request = input(c(CYAN, "  › ")).strip()
         if not user_request:
             print(c(RED, "  No request provided. Exiting."))
             sys.exit(0)
 
-    retriever = NoteRetriever(user_notes)
-    relevant_notes = retriever.get_relevant(user_request, top_k=5)
-    print()
-    print(c(DIM, f"  RAG: Retrieved {len(relevant_notes):,} chars of relevant context"))
-
     # ══════════════════════════════════════════════════════════════════════════
-    # PHASE B: The Swarm Orchestrator → 4 parallel experts
+    # PHASE B: The Swarm Orchestrator (JIT) → 4 parallel experts
     # ══════════════════════════════════════════════════════════════════════════
     phase_header(
-        2, "The Swarm Orchestrator",
-        "Launching 4 expert agents in parallel (asyncio.gather)..."
+        2, "The Swarm Orchestrator — JIT Mode",
+        "Launching 4 experts in parallel. Each agent fetches only what it needs."
     )
-    print(c(DIM, "  Experts: 📋 PM  ⚙️ Lead Dev  📣 Marketer  🔒 Security Analyst"))
-    print(c(DIM, "  Shared cached context: Digital DNA + Relevant Notes"))
+    print(c(DIM, "  Experts: 📋 PM  ⚙️ Lead Dev  📣 Marketer  🔒 Security"))
+    print(c(DIM, "  Context per agent: ~300-token INDEX + on-demand section reads"))
+    print(c(DIM, "  Shared cached prefix: DNA + Index (written once, read 3× from cache)"))
     print()
 
     t2 = time.monotonic()
     orchestrator = SwarmOrchestrator(client)
-    expert_results = await orchestrator.run(user_request, dna, relevant_notes)
+    expert_results = await orchestrator.run(user_request, dna, kb)
     t3 = time.monotonic()
 
     print(c(GREEN, f"  ✓ All 4 experts completed in {(t3-t2):.1f}s (parallel)"))
     print()
 
-    total_cache_read = sum(r.cache_read_tokens for r in expert_results)
-    total_input = sum(r.input_tokens for r in expert_results)
-
+    # ── Per-expert stats ──────────────────────────────────────────────────────
     separator()
+    total_input = sum(r.input_tokens for r in expert_results)
+    total_cache_read = sum(r.cache_read_tokens for r in expert_results)
+    total_cache_created = sum(r.cache_created_tokens for r in expert_results)
+    total_api_calls = sum(r.total_api_calls for r in expert_results)
+
     for r in expert_results:
-        hit = "✓ cache hit" if r.cache_read_tokens > 0 else "  cache miss"
-        color = GREEN if r.cache_read_tokens > 0 else YELLOW
-        stat_line(
-            f"{r.emoji} {r.title}:",
-            f"{r.duration_ms:.0f}ms  |  input: {r.input_tokens:,}  |  {c(color, hit)}",
-            WHITE
-        )
+        sections_read = [tc.section_name for tc in r.tool_calls]
+        sections_str = ", ".join(f'"{s}"' for s in sections_read) if sections_read else "none"
+        cache_hit = r.cache_read_tokens > 0
+        hit_str = c(GREEN, "✓ cache hit") if cache_hit else c(YELLOW, "  cache miss")
+
+        print(f"  {r.emoji} {c(BOLD, r.title)}")
+        stat_line("  API calls:", f"{r.total_api_calls}  ({len(r.tool_calls)} section reads)", DIM)
+        stat_line("  Sections read:", sections_str, CYAN)
+        stat_line("  Input tokens:", f"{r.input_tokens:,}  |  {hit_str}", WHITE)
+        stat_line("  Duration:", f"{r.duration_ms:.0f}ms", DIM)
+        print()
+
     separator()
     stat_line("Total input tokens (4 agents):", f"{total_input:,}", YELLOW)
     stat_line("Total cache_read tokens:", f"{total_cache_read:,}", GREEN)
-    if total_input > 0:
-        savings_pct = (total_cache_read / (total_input + total_cache_read)) * 100
-        stat_line("Estimated token savings:", f"{savings_pct:.0f}%", GREEN)
+    stat_line("Total API calls:", str(total_api_calls), DIM)
+
+    # Compare vs hypothetical full-context injection
+    hypothetical_full = stats['full_notes_tokens'] * 4
+    if hypothetical_full > 0:
+        savings = (1 - total_input / hypothetical_full) * 100
+        stat_line(
+            "vs full-context injection:",
+            f"~{max(0, savings):.0f}% fewer tokens",
+            GREEN
+        )
     separator()
 
-    # Show individual expert plans
+    # ── Expert plan previews ──────────────────────────────────────────────────
     print()
-    print(c(BOLD + WHITE, "  Individual Expert Plans:"))
-    print()
+    print(c(BOLD + WHITE, "  Expert Plans Preview:"))
     for r in expert_results:
-        print(c(BOLD + MAGENTA, f"  {'─'*60}"))
-        # Show first 400 chars of each plan
-        preview = r.content[:400].replace("\n", "\n  ")
-        print(c(DIM, f"  {preview}..."))
         print()
+        print(c(BOLD + MAGENTA, f"  {'─'*58}"))
+        preview = r.content[:350].replace("\n", "\n  ")
+        print(c(DIM, f"  {preview}..."))
 
     # ══════════════════════════════════════════════════════════════════════════
-    # PHASE C: The Aggregator → Unified report (streaming)
+    # PHASE C: The Aggregator → Unified streaming report
     # ══════════════════════════════════════════════════════════════════════════
     phase_header(
         3, "The Aggregator",
-        "Synthesizing 4 expert plans into one unified report (streaming)..."
+        "Synthesizing 4 expert plans → unified report (streaming)..."
     )
     print()
 
@@ -207,10 +229,10 @@ async def run_pipeline(notes_path: str, user_request: str | None):
 
     # ── Final summary ─────────────────────────────────────────────────────────
     total_time = t5 - t0
+    parallel_saved = (t3 - t2) * 3  # saved by running 4 agents instead of sequential
     print()
-    print(c(BOLD + CYAN, f"  🏁 Total pipeline time: {total_time:.1f}s"))
-    print(c(DIM, f"     (Sequential equivalent: ~{total_time + (t3-t2)*3:.0f}s — "
-                 f"{((t3-t2)*3/total_time*100):.0f}% faster via parallelism)"))
+    print(c(BOLD + CYAN, f"  🏁 Total wall-clock time: {total_time:.1f}s"))
+    print(c(DIM, f"     Parallelism saved ~{parallel_saved:.0f}s vs sequential execution"))
     print()
 
 
@@ -223,7 +245,7 @@ def main():
     parser.add_argument(
         "--notes",
         default="demo_notes.md",
-        help="Path to your personal notes file (default: demo_notes.md)"
+        help="Path to your personal notes (default: demo_notes.md)"
     )
     parser.add_argument(
         "--request",
